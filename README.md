@@ -1,7 +1,7 @@
  Othello
 
 A simple yet polished Othello (Reversi) game built in pure Python, following  
-the PSS style guidelines. No external libraries are required — just run and  
+the style guidelines. No external libraries are required — just run and  
 play directly in your terminal.
 
  Features
