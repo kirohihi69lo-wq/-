@@ -1,0 +1,301 @@
+# othello_console.py
+# Pure-Python, no dependencies. Console Othello/Reversi.
+# - Human vs CPU / Human vs Human
+# - CPU: corner-weighted greedy + shallow search
+# - Safe I/O & error log
+# MIT (c) 2025 HIROKI
+
+from __future__ import annotations
+import sys, time, random
+
+ERR_LOG = "error_log.txt"
+
+
+def _elog(msg: str) -> None:
+    try:
+        with open(ERR_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+EMPTY, BLACK, WHITE = ".", "●", "○"
+DIRS = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+SIZE = 8
+
+
+def opponent(c: str) -> str:
+    return WHITE if c == BLACK else BLACK
+
+
+def in_bounds(r: int, c: int) -> bool:
+    return 0 <= r < SIZE and 0 <= c < SIZE
+
+
+class Board:
+    def __init__(self) -> None:
+        self.g = [[EMPTY] * SIZE for _ in range(SIZE)]
+        mid = SIZE // 2
+        self.g[mid - 1][mid - 1] = WHITE
+        self.g[mid][mid] = WHITE
+        self.g[mid - 1][mid] = BLACK
+        self.g[mid][mid - 1] = BLACK
+
+    def copy(self) -> "Board":
+        b = Board.__new__(Board)
+        b.g = [row[:] for row in self.g]
+        return b
+
+    def place(self, r: int, c: int, color: str) -> bool:
+        """Place color at (r,c) if legal. Flip discs. Return True if moved."""
+        if not in_bounds(r, c) or self.g[r][c] != EMPTY:
+            return False
+        opp = opponent(color)
+        flips = []
+        for dr, dc in DIRS:
+            rr, cc = r + dr, c + dc
+            path = []
+            while in_bounds(rr, cc) and self.g[rr][cc] == opp:
+                path.append((rr, cc))
+                rr += dr
+                cc += dc
+            if path and in_bounds(rr, cc) and self.g[rr][cc] == color:
+                flips.extend(path)
+        if not flips:
+            return False
+        self.g[r][c] = color
+        for rr, cc in flips:
+            self.g[rr][cc] = color
+        return True
+
+    def legal_moves(self, color: str):
+        ms = []
+        for r in range(SIZE):
+            for c in range(SIZE):
+                if self.g[r][c] != EMPTY:
+                    continue
+                # quick check: must touch opponent
+                opp = opponent(color)
+                touch = False
+                for dr, dc in DIRS:
+                    rr, cc = r + dr, c + dc
+                    if in_bounds(rr, cc) and self.g[rr][cc] == opp:
+                        touch = True
+                        break
+                if not touch:
+                    continue
+                # simulate minimal: stop early on first valid dir
+                if self._legal_at(r, c, color):
+                    ms.append((r, c))
+        return ms
+
+    def _legal_at(self, r: int, c: int, color: str) -> bool:
+        if self.g[r][c] != EMPTY:
+            return False
+        opp = opponent(color)
+        for dr, dc in DIRS:
+            rr, cc = r + dr, c + dc
+            seen = False
+            while in_bounds(rr, cc) and self.g[rr][cc] == opp:
+                seen = True
+                rr += dr
+                cc += dc
+            if seen and in_bounds(rr, cc) and self.g[rr][cc] == color:
+                return True
+        return False
+
+    def score(self):
+        b = sum(x == BLACK for row in self.g for x in row)
+        w = sum(x == WHITE for row in self.g for x in row)
+        return b, w
+
+    def game_over(self) -> bool:
+        return not self.legal_moves(BLACK) and not self.legal_moves(WHITE)
+
+    def render(self, hints=None) -> None:
+        """Print board with coordinates; hints = set of (r,c)."""
+        hints = hints or set()
+        header = "   " + " ".join(chr(ord("a") + i) for i in range(SIZE))
+        print(header)
+        for r in range(SIZE):
+            line = []
+            for c in range(SIZE):
+                if (r, c) in hints and self.g[r][c] == EMPTY:
+                    line.append("*")
+                else:
+                    line.append(self.g[r][c])
+            print(f"{r+1:>2} " + " ".join(line))
+        b, w = self.score()
+        print(f"●: {b}   ○: {w}")
+
+
+# ---- CPU player (greedy + corner priority + shallow lookahead) ----
+
+CORNER = {(0, 0), (0, SIZE - 1), (SIZE - 1, 0), (SIZE - 1, SIZE - 1)}
+EDGE = (
+    {(0, c) for c in range(SIZE)}
+    | {(SIZE - 1, c) for c in range(SIZE)}
+    | {(r, 0) for r in range(SIZE)}
+    | {(r, SIZE - 1) for r in range(SIZE)}
+)
+
+
+def eval_board(b: Board, me: str) -> int:
+    you = opponent(me)
+    bm, wm = b.score()
+    disc_diff = (bm - wm) if me == BLACK else (wm - bm)
+    mobility = len(b.legal_moves(me)) - len(b.legal_moves(you))
+    corners = sum(
+        (r, c) in CORNER and b.g[r][c] == me for r in range(SIZE) for c in range(SIZE)
+    ) - sum(
+        (r, c) in CORNER and b.g[r][c] == you for r in range(SIZE) for c in range(SIZE)
+    )
+    edges = sum(
+        (r, c) in EDGE and b.g[r][c] == me for r in range(SIZE) for c in range(SIZE)
+    ) - sum(
+        (r, c) in EDGE and b.g[r][c] == you for r in range(SIZE) for c in range(SIZE)
+    )
+    return 30 * corners + 8 * edges + 6 * mobility + disc_diff
+
+
+def best_move(b: Board, color: str, depth: int = 2):
+    moves = b.legal_moves(color)
+    if not moves:
+        return None
+    # corner first
+    for m in moves:
+        if m in CORNER:
+            return m
+    # shallow search (max over greedy next)
+    rng = random.Random(2025)
+    best, best_val = None, -(10**9)
+    rng.shuffle(moves)
+    for m in moves:
+        nb = b.copy()
+        nb.place(m[0], m[1], color)
+        val = eval_deep(nb, opponent(color), color, depth - 1)
+        if val > best_val:
+            best, best_val = m, val
+    return best
+
+
+def eval_deep(b: Board, turn: str, me: str, depth: int) -> int:
+    if depth <= 0 or b.game_over():
+        return eval_board(b, me)
+    moves = b.legal_moves(turn)
+    if not moves:
+        # pass
+        return eval_deep(b, opponent(turn), me, depth - 1)
+    # minimize if opponent, maximize if me
+    vals = []
+    for m in moves:
+        nb = b.copy()
+        nb.place(m[0], m[1], turn)
+        vals.append(eval_deep(nb, opponent(turn), me, depth - 1))
+    return max(vals) if turn == me else min(vals)
+
+
+# ---- UI / game loop ----
+
+HELP = """Commands:
+  move:          e.g. 'd3' (column letter + row number)
+  'pass':        pass turn if no legal move
+  'hint':        toggle legal-move hints
+  'score':       show current score
+  'help':        show this help
+  'quit':        exit
+"""
+
+
+def parse_move(s: str):
+    s = s.strip().lower()
+    if len(s) < 2:
+        return None
+    col = ord(s[0]) - ord("a")
+    try:
+        row = int(s[1:]) - 1
+    except Exception:
+        return None
+    if in_bounds(row, col):
+        return (row, col)
+    return None
+
+
+def play(mode: str = "hvc") -> None:
+    # mode: "hvc" human vs cpu, "hvh" human vs human
+    b = Board()
+    turn = BLACK
+    hints_on = True
+    human_color = BLACK if mode == "hvc" else None
+    print("Console Othello (Pure Python) — ●=Black, ○=White")
+    print(HELP)
+    while True:
+        if b.game_over():
+            b.render()
+            bb, ww = b.score()
+            winner = "Black (●)" if bb > ww else ("White (○)" if ww > bb else "Draw")
+            print(f"Game over: ●{bb} vs ○{ww} → {winner}")
+            return
+
+        moves = b.legal_moves(turn)
+        if not moves:
+            print(f"{'Black' if turn==BLACK else 'White'} has no legal moves. Pass.")
+            turn = opponent(turn)
+            continue
+
+        is_human = (mode == "hvh") or (mode == "hvc" and turn == human_color)
+        hints = set(moves) if hints_on and is_human else set()
+        b.render(hints=hints)
+
+        if is_human:
+            try:
+                s = (
+                    input(f"{'Black' if turn==BLACK else 'White'} move (e.g. d3) > ")
+                    .strip()
+                    .lower()
+                )
+            except (EOFError, KeyboardInterrupt):
+                print("\nBye.")
+                return
+            if s in ("quit", "exit"):
+                return
+            if s == "help":
+                print(HELP)
+                continue
+            if s == "hint":
+                hints_on = not hints_on
+                continue
+            if s == "score":
+                bb, ww = b.score()
+                print(f"●{bb} ○{ww}")
+                continue
+            if s == "pass":
+                turn = opponent(turn)
+                continue
+            mv = parse_move(s)
+            if not mv or mv not in moves or not b.place(mv[0], mv[1], turn):
+                print("Invalid move.")
+                continue
+        else:
+            mv = best_move(b, turn, depth=2)
+            assert mv is not None
+            b.place(mv[0], mv[1], turn)
+            print(f"CPU played {chr(ord('a')+mv[1])}{mv[0]+1}")
+
+        turn = opponent(turn)
+
+
+def main(argv):
+    try:
+        mode = "hvc"
+        if len(argv) >= 2:
+            if argv[1] in ("hvc", "hvh"):
+                mode = argv[1]
+        play(mode)
+    except Exception as e:
+        _elog(f"fatal: {e!r}")
+        print("Unexpected error. See error_log.txt")
+
+
+if __name__ == "__main__":
+    main(sys.argv)
