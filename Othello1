@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#Othello/Reversi (pure Python, stdlib only)
+# License: MIT (c) HIROKI
+
+from __future__ import annotations
+
+import math
+import random
+import sys
+import time
+from dataclasses import dataclass
+from typing import Iterable, List, Optional, Sequence, Tuple
+
+
+# --- Types and constants ---
+
+
+Coord = Tuple[int, int]
+Move = Coord
+Color = int  # 1=Black, -1=White
+
+DIRS: Tuple[Coord, ...] = (
+    (-1, -1),
+    (-1, 0),
+    (-1, 1),
+    (0, -1),
+    (0, 1),
+    (1, -1),
+    (1, 0),
+    (1, 1),
+)
+
+SIZE: int = 8
+EMPTY: int = 0
+BLACK: int = 1
+WHITE: int = -1
+
+PIECES = {BLACK: "●", WHITE: "○", EMPTY: "·"}
+
+COORD_LABELS = "abcdefgh"
+
+
+# --- Utilities ---
+
+
+def other(color: Color) -> Color:
+    """Return opponent color."""
+    return -color
+
+
+def inside(p: Coord) -> bool:
+    """Check board bounds."""
+    r, c = p
+    return 0 <= r < SIZE and 0 <= c < SIZE
+
+
+def to_move_str(mv: Optional[Move]) -> str:
+    """Serialize move for logs."""
+    if mv is None:
+        return "pass"
+    r, c = mv
+    return f"{COORD_LABELS[c]}{r + 1}"
+
+
+def parse_move(text: str) -> Optional[Move]:
+    """Parse user input like 'd3' or 'pass'."""
+    s = text.strip().lower()
+    if s in {"p", "pass"}:
+        return None
+    if len(s) != 2:
+        raise ValueError("Use like d3 or 'pass'.")
+    col = COORD_LABELS.find(s[0])
+    if col < 0:
+        raise ValueError("Column a-h.")
+    row_ch = s[1]
+    if not row_ch.isdigit():
+        raise ValueError("Row 1-8.")
+    row = int(row_ch) - 1
+    if not (0 <= row < SIZE):
+        raise ValueError("Row 1-8.")
+    return (row, col)
+
+
+# --- Board ---
+
+
+@dataclass(frozen=True)
+class Board:
+    """Immutable Othello board for safe AI search.
+
+    The board is a flat tuple of ints. Immutability makes it hashable,
+    which stabilizes transposition caching and avoids surprise aliasing.
+    """
+
+    cells: Tuple[int, ...]  # row-major, SIZE*SIZE
+
+    @staticmethod
+    def initial() -> "Board":
+        """Create starting position."""
+        cells = [EMPTY] * (SIZE * SIZE)
+        mid = SIZE // 2
+
+        def s(r: int, c: int, v: int) -> None:
+            cells[r * SIZE + c] = v
+
+        s(mid - 1, mid - 1, WHITE)
+        s(mid - 1, mid, BLACK)
+        s(mid, mid - 1, BLACK)
+        s(mid, mid, WHITE)
+        return Board(tuple(cells))
+
+    def get(self, r: int, c: int) -> int:
+        """Get cell."""
+        return self.cells[r * SIZE + c]
+
+    def put(self, r: int, c: int, v: int) -> "Board":
+        """Return new board with cell replaced."""
+        idx = r * SIZE + c
+        cells = list(self.cells)
+        cells[idx] = v
+        return Board(tuple(cells))
+
+    def count(self, v: int) -> int:
+        """Count pieces of value v. v in {BLACK, WHITE, EMPTY}."""
+        return sum(1 for x in self.cells if x == v)
+
+    def legal(self, color: Color) -> List[Move]:
+        """List legal moves for color."""
+        moves: List[Move] = []
+        opp = other(color)
+        for r in range(SIZE):
+            for c in range(SIZE):
+                if self.get(r, c) != EMPTY:
+                    continue
+                if self._would_flip((r, c), color, opp):
+                    moves.append((r, c))
+        return moves
+
+    def apply(self, mv: Optional[Move], color: Color) -> "Board":
+        """Apply move (None=pass). Return new board."""
+        if mv is None:
+            return self
+        r, c = mv
+        if self.get(r, c) != EMPTY:
+            raise ValueError("Cell not empty.")
+        opp = other(color)
+        flips = self._collect_flips((r, c), color, opp)
+        if not flips:
+            raise ValueError("Illegal move.")
+        b = self.put(r, c, color)
+        for fr, fc in flips:
+            b = b.put(fr, fc, color)
+        return b
+
+    def terminal(self) -> bool:
+        """Game is over when both sides have no legal move."""
+        return not self.legal(BLACK) and not self.legal(WHITE)
+
+    def score(self) -> Tuple[int, int]:
+        """Return (black_count, white_count)."""
+        b = self.count(BLACK)
+        w = self.count(WHITE)
+        return (b, w)
+
+    # --- internal helpers (flip detection) ---
+
+    def _would_flip(self, mv: Move, color: Color, opp: Color) -> bool:
+        """Check quickly if any direction flips. Early exit saves time."""
+        r0, c0 = mv
+        for dr, dc in DIRS:
+            r, c = r0 + dr, c0 + dc
+            seen = False
+            while inside((r, c)) and self.get(r, c) == opp:
+                seen = True
+                r += dr
+                c += dc
+            if seen and inside((r, c)) and self.get(r, c) == color:
+                return True
+        return False
+
+    def _collect_flips(self, mv: Move, color: Color, opp: Color) -> List[Coord]:
+        """Collect actual flips for a legal move."""
+        r0, c0 = mv
+        flips: List[Coord] = []
+        for dr, dc in DIRS:
+            path: List[Coord] = []
+            r, c = r0 + dr, c0 + dc
+            while inside((r, c)) and self.get(r, c) == opp:
+                path.append((r, c))
+                r += dr
+                c += dc
+            if path and inside((r, c)) and self.get(r, c) == color:
+                flips.extend(path)
+        return flips
+
+
+# --- Rendering ---
+
+
+def render_board(b: Board) -> str:
+    """Return a pretty board string."""
+    lines: List[str] = []
+    lines.append("    a b c d e f g h")
+    lines.append("  +-----------------+")
+    for r in range(SIZE):
+        row = [PIECES[b.get(r, c)] for c in range(SIZE)]
+        lines.append(f"{r + 1} | " + " ".join(row) + f" |")
+    lines.append("  +-----------------+")
+    b_cnt, w_cnt = b.score()
+    lines.append(f"  Black(●): {b_cnt:2d}  White(○): {w_cnt:2d}")
+    return "\n".join(lines)
+
+
+# --- Heuristics and evaluation ---
+
+
+# Corners are decisive; X-squares are risky. We encode that bias.
+CORNER_SET = {(0, 0), (0, 7), (7, 0), (7, 7)}
+X_SQUARES = {(1, 1), (1, 6), (6, 1), (6, 6)}
+C_SQUARES = {(0, 1), (1, 0), (0, 6), (1, 7), (6, 0), (7, 1), (6, 7), (7, 6)}
+
+# Mobility > corner > parity (early). Stability rises late.
+
+
+def mobility(board: Board, color: Color) -> int:
+    """Difference in available moves. Why: drives initiative."""
+    return len(board.legal(color)) - len(board.legal(other(color)))
+
+
+def corner_score(board: Board, color: Color) -> int:
+    """Corners matter; we count them with heavy weights."""
+    val = 0
+    for r, c in CORNER_SET:
+        v = board.get(r, c)
+        if v == color:
+            val += 25
+        elif v == other(color):
+            val -= 25
+    # Penalize X/C squares when corner is free; common Othello motif.
+    for r, c in X_SQUARES:
+        if board.get(r, c) == color:
+            near = (0 if r == 1 else 7, 0 if c == 1 else 7)
+            if board.get(*near) == EMPTY:
+                val -= 8
+    for r, c in C_SQUARES:
+        if board.get(r, c) == color:
+            near = (0 if r in {0, 1} else 7, c)
+            near2 = (r, 0 if c in {0, 1} else 7)
+            if board.get(*near) == EMPTY or board.get(*near2) == EMPTY:
+                val -= 4
+    return val
+
+
+def piece_diff(board: Board, color: Color) -> int:
+    """Parity: early it is noise; late it decides the game."""
+    b, w = board.score()
+    return (b - w) if color == BLACK else (w - b)
+
+
+def stability_hint(board: Board, color: Color) -> int:
+    """Cheap stability proxy: edges that cannot be flipped soon."""
+    val = 0
+    edges = (
+        [(0, c) for c in range(SIZE)],
+        [(7, c) for c in range(SIZE)],
+        [(r, 0) for r in range(SIZE)],
+        [(r, 7) for r in range(SIZE)],
+    )
+    for line in edges:
+        run = 0
+        for r, c in line:
+            if board.get(r, c) == color:
+                run += 1
+                if run >= 2:
+                    val += 1
+            else:
+                run = 0
+    return val
+
+
+def phase(board: Board) -> float:
+    """0..1 game phase by filled ratio to modulate terms."""
+    filled = SIZE * SIZE - board.count(EMPTY)
+    return filled / float(SIZE * SIZE)
+
+
+def eval_pos(board: Board, color: Color) -> int:
+    """Blend features by phase. Keeps behavior human-like."""
+    ph = phase(board)
+    mob = mobility(board, color) * 6
+    corn = corner_score(board, color) * 4
+    stab = stability_hint(board, color) * 3
+    if ph < 0.5:
+        diff = piece_diff(board, color) * 1
+    else:
+        diff = piece_diff(board, color) * 3
+    return mob + corn + stab + diff
+
+
+# --- Search (alpha-beta) ---
+
+
+@dataclass
+class SearchStats:
+    """Light telemetry for usability and tuning."""
+
+    nodes: int = 0
+    depth: int = 0
+    ms: float = 0.0
+
+
+def order_moves(board: Board, color: Color, moves: Sequence[Move]) -> List[Move]:
+    """Move ordering increases pruning. Corners first, then mobility."""
+
+    def key(m: Move) -> Tuple[int, int]:
+        corner = 1 if m in CORNER_SET else 0
+        b2 = board.apply(m, color)
+        mob = len(b2.legal(other(color)))
+        return (corner, -mob)
+
+    return sorted(moves, key=key, reverse=True)
+
+
+def alphabeta(
+    board: Board,
+    color: Color,
+    depth: int,
+    alpha: int,
+    beta: int,
+    stats: SearchStats,
+    stop_at: float,
+) -> int:
+    """Alpha-beta with pass handling and time guard."""
+    if time.perf_counter() >= stop_at:
+        # Time guard keeps console snappy.
+        return eval_pos(board, color)
+    stats.nodes += 1
+    if depth == 0 or board.terminal():
+        return eval_pos(board, color)
+    moves = board.legal(color)
+    if not moves:
+        # Pass rule. Two passes end handled by terminal().
+        val = -alphabeta(board, other(color), depth - 1, -beta, -alpha, stats, stop_at)
+        return val
+    for mv in order_moves(board, color, moves):
+        nxt = board.apply(mv, color)
+        val = -alphabeta(nxt, other(color), depth - 1, -beta, -alpha, stats, stop_at)
+        if val > alpha:
+            alpha = val
+            if alpha >= beta:
+                break
+    return alpha
+
+
+def search_best(
+    board: Board, color: Color, depth: int, time_ms: int
+) -> Tuple[Optional[Move], SearchStats]:
+    """Iterative deepening for graceful strength control."""
+    start = time.perf_counter()
+    stop_at = start + (time_ms / 1_000.0)
+    best: Optional[Move] = None
+    best_val = -10_000
+    stats = SearchStats()
+    moves = order_moves(board, color, board.legal(color))
+    for d in range(1, depth + 1):
+        cur_best = best
+        cur_val = best_val
+        for mv in moves:
+            if time.perf_counter() >= stop_at:
+                break
+            nxt = board.apply(mv, color)
+            val = -alphabeta(nxt, other(color), d - 1, -9_999, 9_999, stats, stop_at)
+            if val > cur_val:
+                cur_val = val
+                cur_best = mv
+        if time.perf_counter() >= stop_at:
+            break
+        best = cur_best
+        best_val = cur_val
+        stats.depth = d
+    stats.ms = (time.perf_counter() - start) * 1_000.0
+    return best, stats
+
+
+# --- Bots (difficulty tiers) ---
+
+
+class Bot:
+    """Computer players with distinct difficulty tiers."""
+
+    def __init__(self, level: str):
+        self.level = level
+
+    def choose(self, board: Board, color: Color) -> Tuple[Optional[Move], str]:
+        """Pick a move and return reason for UX clarity."""
+        moves = board.legal(color)
+        if not moves:
+            return None, "no legal moves → pass"
+        match self.level:
+            case "easy":
+                # Why: quick fun. Favor corners randomly else random move.
+                corners = [m for m in moves if m in CORNER_SET]
+                mv = random.choice(corners or moves)
+                return mv, "random (corner bias)"
+            case "normal":
+                # Why: greedy but sensible. Shallow lookahead.
+                best = None
+                best_val = -10_000
+                for mv in moves:
+                    nxt = board.apply(mv, color)
+                    val = eval_pos(nxt, color)
+                    if val > best_val:
+                        best = mv
+                        best_val = val
+                return best, "greedy eval"
+            case "hard":
+                # Why: competitive. Iterative deepening + alpha-beta.
+                depth = 5
+                mv, stats = search_best(board, color, depth, time_ms=1200)
+                mv = mv or random.choice(moves)
+                note = (
+                    f"ab depth≈{stats.depth} nodes={stats.nodes} " f"{stats.ms:.0f}ms"
+                )
+                return mv, note
+            case _:
+                raise ValueError("Unknown level.")
+
+
+@dataclass
+class PlayerCfg:
+    name: str
+    is_human: bool
+    bot: Optional[Bot]
+    color: Color
+
+
+def print_header() -> None:
+    """Title block."""
+    print("PSSOthello — Console Othello (MIT, HIROKI)")
+    print("Controls: enter like 'd3', or 'pass', or 'quit'")
+    print("Black plays first (●). White is ○.")
+    print("")
+
+
+def ask_mode() -> Tuple[PlayerCfg, PlayerCfg]:
+    """Interactively pick mode and difficulty."""
+
+    def ask_side() -> Color:
+        while True:
+            s = input("Choose your side: (b)lack / (w)hite: ").strip()
+            if s.lower().startswith("b"):
+                return BLACK
+            if s.lower().startswith("w"):
+                return WHITE
+            print("Type b or w.")
+
+    def ask_level() -> str:
+        while True:
+            s = input("AI level: easy / normal / hard: ").strip().lower()
+            if s in {"easy", "normal", "hard"}:
+                return s
+            print("Type easy, normal, or hard.")
+
+    print("Mode:")
+    print("  1) Human vs Human")
+    print("  2) Human vs Computer")
+    print("  3) Computer vs Computer (demo)")
+    while True:
+        mode = input("Select 1/2/3: ").strip()
+        if mode in {"1", "2", "3"}:
+            break
+        print("Type 1, 2, or 3.")
+    if mode == "1":
+        p1 = PlayerCfg("Player1", True, None, BLACK)
+        p2 = PlayerCfg("Player2", True, None, WHITE)
+        return p1, p2
+    if mode == "2":
+        side = ask_side()
+        level = ask_level()
+        if side == BLACK:
+            p1 = PlayerCfg("You", True, None, BLACK)
+            p2 = PlayerCfg(f"CPU-{level}", False, Bot(level), WHITE)
+        else:
+            p1 = PlayerCfg(f"CPU-{level}", False, Bot(level), BLACK)
+            p2 = PlayerCfg("You", True, None, WHITE)
+        return p1, p2
+    # mode == "3"
+    l1 = ask_level()
+    l2 = ask_level()
+    p1 = PlayerCfg(f"CPU-{l1}", False, Bot(l1), BLACK)
+    p2 = PlayerCfg(f"CPU-{l2}", False, Bot(l2), WHITE)
+    return p1, p2
+
+
+def turn_prompt(cfg: PlayerCfg, board: Board) -> Optional[Move]:
+    """Read human move with validation."""
+    moves = board.legal(cfg.color)
+    if not moves:
+        print("No legal moves. You must pass.")
+        return None
+    while True:
+        s = input(f"{cfg.name} move: ").strip()
+        if s.lower() in {"q", "quit", "exit"}:
+            raise SystemExit(0)
+        try:
+            mv = parse_move(s)
+        except ValueError as e:
+            print(str(e))
+            continue
+        if mv is None:
+            if moves:
+                print("You have legal moves; cannot pass.")
+                continue
+            return None
+        if mv not in moves:
+            print("Illegal for now. Try again.")
+            continue
+        return mv
+
+
+def play_game(p1: PlayerCfg, p2: PlayerCfg) -> None:
+    """Main loop. Handles passes and a clean end."""
+    board = Board.initial()
+    cur = p1
+    opp = p2
+    print(render_board(board))
+    while True:
+        moves = board.legal(cur.color)
+        if not moves and not board.legal(opp.color):
+            break
+        print(f"\n{cur.name} ({'●' if cur.color == BLACK else '○'}) to move.")
+        if cur.is_human:
+            mv = turn_prompt(cur, board)
+            note = "human"
+        else:
+            t0 = time.perf_counter()
+            mv, note = cur.bot.choose(board, cur.color)  # type: ignore
+            dt = (time.perf_counter() - t0) * 1_000
+            print(f"CPU picks {to_move_str(mv)} [{note}; {dt:.0f}ms]")
+        try:
+            board = board.apply(mv, cur.color)
+        except ValueError as e:
+            # Human-only path. AI never proposes illegal by design.
+            print(f"Rejected: {e}")
+            continue
+        print("")
+        print(render_board(board))
+        # swap turns
+        cur, opp = opp, cur
+    b, w = board.score()
+    print("\nGame over.")
+    print(f"Final: Black {b} — White {w}")
+    if b > w:
+        print("Winner: Black (●)")
+    elif w > b:
+        print("Winner: White (○)")
+    else:
+        print("Draw")
+
+
+# --- Quick self-checks (minimal, zero deps) ---
+
+
+def _self_tests() -> None:
+    """Sanity tests to catch regressions quickly.
+
+    Why small: console-first UX. We avoid heavy frameworks and keep
+    checks fast so users can run it anywhere.
+    """
+    b = Board.initial()
+    assert b.count(EMPTY) == 60
+    assert len(b.legal(BLACK)) == 4
+    assert len(b.legal(WHITE)) == 4
+    b2 = b.apply((2, 3), BLACK)
+    assert b2.get(3, 3) == BLACK
+    # Corner bias: place a corner and see eval swing.
+    corner_b = b.put(0, 0, BLACK)
+    e1 = eval_pos(corner_b, BLACK)
+    e2 = eval_pos(corner_b, WHITE)
+    assert e1 > e2
+    # Parsing
+    assert parse_move("d3") == (2, 3)
+    assert parse_move("PASS") is None
+
+
+# --- Entry point ---
+
+
+def main(argv: Sequence[str]) -> int:
+    """CLI entry. Mode flags are optional to stay friendly.
+
+    --demo runs a short CPU vs CPU game with fixed seeds.
+    """
+    _self_tests()
+    random.seed(42)
+    if len(argv) >= 2 and argv[1] == "--demo":
+        p1 = PlayerCfg("CPU-hard", False, Bot("hard"), BLACK)
+        p2 = PlayerCfg("CPU-normal", False, Bot("normal"), WHITE)
+        print_header()
+        play_game(p1, p2)
+        return 0
+    print_header()
+    p1, p2 = ask_mode()
+    play_game(p1, p2)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv))
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        raise SystemExit(2)
